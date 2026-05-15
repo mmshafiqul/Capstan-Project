@@ -202,25 +202,32 @@ jobs:
     - name: Run smoke tests
       run: |
         # Wait for pods to be fully ready
-        sleep 60
-        
-        # Get Python service pod
-        PYTHON_POD=$(kubectl get pods -n urlshortner -l app=python-service -o jsonpath='{.items[0].metadata.name}')
-        
-        # Test Python service health
-        kubectl exec -n urlshortner $PYTHON_POD -- curl -f http://localhost:5000/ || exit 1
-        
-        # Get Go service pod
-        GO_POD=$(kubectl get pods -n urlshortner -l app=go-service -o jsonpath='{.items[0].metadata.name}')
-        
-        # Test Go service shorten endpoint (no dedicated /health)
-        kubectl exec -n urlshortner $GO_POD -- curl -sf -X POST http://localhost:8000/api/shorten -H 'Content-Type: application/json' -d '{"long_url":"https://example.com"}' >/dev/null || exit 1
-        
-        # Get Node service pod
-        NODE_POD=$(kubectl get pods -n urlshortner -l app=node-service -o jsonpath='{.items[0].metadata.name}')
-        
+        sleep 30
+
+        kubectl port-forward -n urlshortner svc/python-service 5000:5000 >/tmp/python-port-forward.log 2>&1 &
+        PYTHON_PORT_FORWARD_PID=$!
+        kubectl port-forward -n urlshortner svc/go-service 8000:8000 >/tmp/go-port-forward.log 2>&1 &
+        GO_PORT_FORWARD_PID=$!
+        kubectl port-forward -n urlshortner svc/node-service 3000:3000 >/tmp/node-port-forward.log 2>&1 &
+        NODE_PORT_FORWARD_PID=$!
+
+        cleanup() {
+          kill ${PYTHON_PORT_FORWARD_PID} ${GO_PORT_FORWARD_PID} ${NODE_PORT_FORWARD_PID} || true
+        }
+        trap cleanup EXIT
+
+        sleep 10
+
+        # Test Python service dashboard
+        curl -f http://127.0.0.1:5000/ >/dev/null
+
+        # Test Go service shorten endpoint
+        curl -sf -X POST http://127.0.0.1:8000/api/shorten \
+          -H 'Content-Type: application/json' \
+          -d '{"long_url":"https://example.com"}' >/dev/null
+
         # Test Node service health
-        kubectl exec -n urlshortner $NODE_POD -- curl -f http://localhost:3000/health || exit 1
+        curl -f http://127.0.0.1:3000/health >/dev/null
 
   # Load Testing
   load-test:
