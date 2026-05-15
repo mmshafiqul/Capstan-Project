@@ -285,7 +285,7 @@ jobs:
         cp k6-report.html load-test-results/ || true
 
     - name: Upload load test results
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: load-test-results
         path: load-test-results/
