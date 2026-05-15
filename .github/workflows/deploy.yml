@@ -58,7 +58,7 @@ jobs:
         python -m pytest || true  # Continue even if no tests exist
 
     - name: SonarQube Scan
-      uses: SonarSource/sonarqube-scan-action@v4
+      uses: SonarSource/sonarqube-scan-action@v6
       env:
         SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
@@ -141,6 +141,20 @@ jobs:
 
     - name: Deploy to Kubernetes
       run: |
+        wait_for_deployment() {
+          local deployment="$1"
+          local selector="$2"
+
+          if ! kubectl rollout status "deployment/${deployment}" -n urlshortner --timeout=300s; then
+            kubectl get deployment "${deployment}" -n urlshortner -o wide || true
+            kubectl get pods -n urlshortner -l "${selector}" -o wide || true
+            kubectl describe deployment "${deployment}" -n urlshortner || true
+            kubectl describe pods -n urlshortner -l "${selector}" || true
+            kubectl logs -n urlshortner -l "${selector}" --tail=100 --all-containers=true || true
+            exit 1
+          fi
+        }
+
         # Update image tags in deployment files
         sed -i 's|your-dockerhub-username|'"${DOCKERHUB_USERNAME}"'|g' k8s/*-deployment.yaml
         
@@ -150,6 +164,9 @@ jobs:
         # Apply ConfigMaps and Secrets
         kubectl apply -f k8s/configmaps.yaml
         kubectl apply -f k8s/secrets.yaml
+
+        # Ensure the current single-replica HPA config is applied before waiting for rollouts.
+        kubectl apply -f k8s/hpa.yaml
         
         # Deploy Redis first
         kubectl apply -f k8s/redis-deployment.yaml
@@ -161,13 +178,12 @@ jobs:
         kubectl apply -f k8s/python-service-deployment.yaml
         
         # Wait for services to be ready
-        kubectl wait --for=condition=available deployment/go-service -n urlshortner --timeout=300s
-        kubectl wait --for=condition=available deployment/node-service -n urlshortner --timeout=300s
-        kubectl wait --for=condition=available deployment/python-service -n urlshortner --timeout=300s
+        wait_for_deployment go-service app=go-service
+        wait_for_deployment node-service app=node-service
+        wait_for_deployment python-service app=python-service
         
-        # Apply Ingress and HPA
+        # Apply Ingress
         kubectl apply -f k8s/ingress.yaml
-        kubectl apply -f k8s/hpa.yaml
 
     - name: Verify deployment
       run: |
