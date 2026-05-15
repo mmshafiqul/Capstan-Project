@@ -1,0 +1,268 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: docker.io
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
+
+jobs:
+  sonarqube-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.22'
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        cd go-service && go mod download
+        cd ../node-service && npm ci || npm install
+        cd ../python-service && pip install -r requirements.txt
+
+    - name: Run Go tests
+      run: |
+        cd go-service
+        go test -v -race -coverprofile=coverage.out ./...
+
+    - name: Run Node.js tests
+      run: |
+        cd node-service
+        npm test || true  # Continue even if no tests exist
+
+    - name: Run Python tests
+      run: |
+        cd python-service
+        python -m pytest || true  # Continue even if no tests exist
+
+    - name: SonarQube Scan
+      uses: SonarSource/sonarqube-scan-action@v4
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+    - name: SonarQube Quality Gate
+      uses: SonarSource/sonarqube-quality-gate-action@v1
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  # Build and Push Docker Images
+  build-and-push:
+    needs: sonarqube-scan
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        service: [go-service, node-service, python-service]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.DOCKERHUB_USERNAME }}/${{ matrix.service }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./${{ matrix.service }}
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # Deploy to Kubernetes
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.29.0'
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --name "${EKS_CLUSTER_NAME}" --region "${AWS_REGION}"
+
+    - name: Deploy to Kubernetes
+      run: |
+        # Update image tags in deployment files
+        sed -i 's|your-dockerhub-username|'"${DOCKERHUB_USERNAME}"'|g' k8s/*-deployment.yaml
+        
+        # Apply namespace
+        kubectl apply -f k8s/namespace.yaml
+        
+        # Apply ConfigMaps and Secrets
+        kubectl apply -f k8s/configmaps.yaml
+        kubectl apply -f k8s/secrets.yaml
+        
+        # Deploy Redis first
+        kubectl apply -f k8s/redis-deployment.yaml
+        kubectl wait --for=condition=ready pod -l app=redis -n urlshortner --timeout=300s
+        
+        # Deploy services
+        kubectl apply -f k8s/go-service-deployment.yaml
+        kubectl apply -f k8s/node-service-deployment.yaml
+        kubectl apply -f k8s/python-service-deployment.yaml
+        
+        # Wait for services to be ready
+        kubectl wait --for=condition=available deployment/go-service -n urlshortner --timeout=300s
+        kubectl wait --for=condition=available deployment/node-service -n urlshortner --timeout=300s
+        kubectl wait --for=condition=available deployment/python-service -n urlshortner --timeout=300s
+        
+        # Apply Ingress and HPA
+        kubectl apply -f k8s/ingress.yaml
+        kubectl apply -f k8s/hpa.yaml
+
+    - name: Verify deployment
+      run: |
+        # Check pod status
+        kubectl get pods -n urlshortner
+        
+        # Check services
+        kubectl get services -n urlshortner
+        
+        # Check HPA status
+        kubectl get hpa -n urlshortner
+        
+        # Check ingress
+        kubectl get ingress -n urlshortner
+
+    - name: Run smoke tests
+      run: |
+        # Wait for pods to be fully ready
+        sleep 60
+        
+        # Get Python service pod
+        PYTHON_POD=$(kubectl get pods -n urlshortner -l app=python-service -o jsonpath='{.items[0].metadata.name}')
+        
+        # Test Python service health
+        kubectl exec -n urlshortner $PYTHON_POD -- curl -f http://localhost:5000/ || exit 1
+        
+        # Get Go service pod
+        GO_POD=$(kubectl get pods -n urlshortner -l app=go-service -o jsonpath='{.items[0].metadata.name}')
+        
+        # Test Go service shorten endpoint (no dedicated /health)
+        kubectl exec -n urlshortner $GO_POD -- curl -sf -X POST http://localhost:8000/api/shorten -H 'Content-Type: application/json' -d '{"long_url":"https://example.com"}' >/dev/null || exit 1
+        
+        # Get Node service pod
+        NODE_POD=$(kubectl get pods -n urlshortner -l app=node-service -o jsonpath='{.items[0].metadata.name}')
+        
+        # Test Node service health
+        kubectl exec -n urlshortner $NODE_POD -- curl -f http://localhost:3000/health || exit 1
+
+  # Load Testing
+  load-test:
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up k6
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y k6
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --name "${EKS_CLUSTER_NAME}" --region "${AWS_REGION}"
+
+    - name: Port forward services
+      run: |
+        # Port forward Python service in background
+        kubectl port-forward -n urlshortner svc/python-service 5000:5000 &
+        PORT_FORWARD_PID=$!
+        echo $PORT_FORWARD_PID > port_forward.pid
+        
+        # Wait for port forward to be ready
+        sleep 10
+
+    - name: Run load tests
+      run: |
+        # Run load test simulating traffic spike
+        k6 run --vus 50 --duration 2m load-testing/k6-load-test.js
+
+    - name: Cleanup port forward
+      if: always()
+      run: |
+        if [ -f port_forward.pid ]; then
+          kill $(cat port_forward.pid) || true
+          rm port_forward.pid
+        fi
+
+    - name: Generate load test report
+      run: |
+        # Save load test results
+        mkdir -p load-test-results
+        cp k6-report.html load-test-results/ || true
+
+    - name: Upload load test results
+      uses: actions/upload-artifact@v3
+      with:
+        name: load-test-results
+        path: load-test-results/

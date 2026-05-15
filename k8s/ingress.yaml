@@ -1,0 +1,62 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: urlshortner-ingress
+  namespace: urlshortner
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: "/$2"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    # Enable sticky sessions for Python service
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "urlshortner-affinity"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
+    # Health check annotations
+    nginx.ingress.kubernetes.io/upstream-keepalive-connections: "100"
+    nginx.ingress.kubernetes.io/upstream-keepalive-timeout: "60"
+    nginx.ingress.kubernetes.io/upstream-keepalive-requests: "1000"
+spec:
+  ingressClassName: nginx
+  rules:
+  - http:
+      paths:
+      # Go API
+      - path: /api/shorten
+        pathType: Exact
+        backend:
+          service:
+            name: go-service
+            port:
+              number: 8000
+
+      # Node metadata API
+      - path: /api/metadata
+        pathType: Prefix
+        backend:
+          service:
+            name: node-service
+            port:
+              number: 3000
+
+      # Redirects:
+      # - External URL: http(s)://<LB_DNS>/r/<code>
+      # - Ingress rewrites to /<code> for go-service
+      - path: /r(/|$)(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: go-service
+            port:
+              number: 8000
+
+      # Default: Python dashboard + Python APIs (/create, /api/stats, etc.)
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: python-service
+            port:
+              number: 5000

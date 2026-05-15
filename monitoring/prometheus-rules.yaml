@@ -1,0 +1,81 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: urlshortner-microservices-rules
+  namespace: monitoring
+  labels:
+    app: prometheus-operator
+    release: prometheus
+spec:
+  groups:
+  - name: urlshortner.rules
+    rules:
+    # Alert on high error rates
+    - alert: HighErrorRate
+      expr: sum(rate(http_requests_total{status=~"5.."}[5m])) by (service) / sum(rate(http_requests_total[5m])) by (service) > 0.1
+      for: 2m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High error rate detected in {{ $labels.service }}"
+        description: "Error rate is {{ $value | humanizePercentage }} for service {{ $labels.service }}"
+
+    # Alert on high response times
+    - alert: HighResponseTime
+      expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)) > 1
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High response time in {{ $labels.service }}"
+        description: "95th percentile response time is {{ $value }}s for service {{ $labels.service }}"
+
+    # Alert on pod restarts
+    - alert: PodRestartHigh
+      expr: increase(kube_pod_container_status_restarts_total[1h]) > 3
+      for: 0m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Pod {{ $labels.pod }} is restarting frequently"
+        description: "Pod {{ $labels.pod }} has restarted {{ $value }} times in the last hour"
+
+    # Alert on HPA max replicas
+    - alert: HPAAtMaxReplicas
+      expr: kube_hpa_status_current_replicas == kube_hpa_spec_max_replicas
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "HPA {{ $labels.hpa }} is at max replicas"
+        description: "HPA {{ $labels.hpa }} has reached max replicas of {{ $value }}"
+
+    # Alert on Redis memory usage
+    - alert: RedisHighMemoryUsage
+      expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.9
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Redis memory usage is high"
+        description: "Redis memory usage is {{ $value | humanizePercentage }} of max"
+
+    # Alert on service down
+    - alert: ServiceDown
+      expr: up{job=~".*-service"} == 0
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Service {{ $labels.job }} is down"
+        description: "Service {{ $labels.job }} has been down for more than 1 minute"
+
+    # Traffic spike detection
+    - alert: TrafficSpike
+      expr: sum(rate(http_requests_total[5m])) by (service) > 100
+      for: 2m
+      labels:
+        severity: info
+      annotations:
+        summary: "Traffic spike detected in {{ $labels.service }}"
+        description: "Request rate is {{ $value }} requests/sec for service {{ $labels.service }}"

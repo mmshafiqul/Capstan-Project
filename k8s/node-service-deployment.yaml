@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-service
+  namespace: urlshortner
+  labels:
+    app: node-service
+    component: metadata-service
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: node-service
+  template:
+    metadata:
+      labels:
+        app: node-service
+        component: metadata-service
+    spec:
+      containers:
+      - name: node-service
+        image: your-dockerhub-username/node-service:latest
+        ports:
+        - containerPort: 3000
+        envFrom:
+        - configMapRef:
+            name: node-service-config
+        - secretRef:
+            name: node-service-secrets
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: node-data
+          mountPath: /app/data
+      volumes:
+      - name: node-data
+        persistentVolumeClaim:
+          claimName: node-service-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-service
+  namespace: urlshortner
+  labels:
+    app: node-service
+    component: metadata-service
+spec:
+  selector:
+    app: node-service
+  ports:
+  - port: 3000
+    targetPort: 3000
+    protocol: TCP
+  type: ClusterIP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: node-service-pvc
+  namespace: urlshortner
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp2
+  resources:
+    requests:
+      storage: 5Gi
